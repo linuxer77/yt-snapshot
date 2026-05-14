@@ -1,36 +1,52 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# YouTube Interval Snapshot Extractor
 
-## Getting Started
+Extract snapshots from a YouTube video at a fixed interval. The backend uses yt-dlp
+to fetch the source and ffmpeg to generate frames on a schedule like
+`-vf fps=1/INTERVAL`.
 
-First, run the development server:
+## Features
+
+- Paste a YouTube URL, set an interval, and process automatically.
+- Optional start and end timestamps to limit the capture range.
+- Progress states for fetching, extracting, and packaging.
+- Responsive gallery with per-frame downloads and a ZIP export.
+- Clear filenames like `video-title_0010s.jpg`.
+- Contact sheet generation (optional).
+
+## Requirements
+
+- Node.js 20+
+- pnpm
+- yt-dlp (available in PATH)
+- ffmpeg (available in PATH)
+
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
+cp .env.example .env.local
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+YTDLP_PATH=yt-dlp
+FFMPEG_PATH=ffmpeg
+JOBS_TTL_MINUTES=60
+```
 
-## Learn More
+## Notes
 
-To learn more about Next.js, take a look at the following resources:
+- Job output is stored under `.data/jobs` and cleaned after the TTL.
+- For long videos, add a worker queue or background job runner.
+- The pipeline is modular so local uploads can be added later.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Possible v2 ideas
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Subtitle-based capture
+- Scene detection
+- OCR tagging for frames
+- Local file uploads and S3 storage
