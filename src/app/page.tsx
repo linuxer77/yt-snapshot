@@ -21,12 +21,6 @@ export default function Home() {
         <SnapshotTool />
       </main>
 
-      <footer className="border-t border-line">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-2 px-4 py-6 text-[13px] leading-5 text-fg-muted sm:flex-row sm:justify-between sm:px-8">
-          <p>Runs yt-dlp and ffmpeg on this server. Files are cleaned up automatically.</p>
-          <p>Open source, MIT license</p>
-        </div>
-      </footer>
     </>
   );
 }
