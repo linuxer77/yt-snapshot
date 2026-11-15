@@ -1,34 +1,37 @@
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { getFramesDir } from "@/lib/server/job-store";
+import { getFramesDir, isValidJobId } from "@/lib/server/job-store";
 import { streamFile } from "@/lib/server/stream";
 
 export const runtime = "nodejs";
 
+const CONTENT_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+};
+
 export async function GET(
-  request: Request,
+  _request: Request,
   { params }: { params: Promise<{ jobId: string; filename: string }> }
 ) {
   const { jobId, filename } = await params;
-  const safeName = path.basename(filename);
-  if (safeName !== filename) {
-    return NextResponse.json({ error: "Invalid filename." }, { status: 400 });
+  const contentType = CONTENT_TYPES[path.extname(filename).toLowerCase()];
+
+  if (!isValidJobId(jobId) || path.basename(filename) !== filename || !contentType) {
+    return NextResponse.json({ error: "Invalid image path." }, { status: 400 });
   }
 
-  const filePath = path.join(getFramesDir(jobId), safeName);
-  try {
-    await fs.access(filePath);
-  } catch {
-    return NextResponse.json({ error: "Image not found." }, { status: 404 });
-  }
-
-  const ext = path.extname(safeName).toLowerCase();
-  const contentType = ext === ".png" ? "image/png" : "image/jpeg";
-
-  return streamFile(filePath, {
+  const response = await streamFile(path.join(getFramesDir(jobId), filename), {
     contentType,
-    filename: safeName,
+    filename,
     disposition: "inline",
+    // A job's frames never change once written.
+    cacheControl: "private, max-age=3600, immutable",
   });
+
+  return (
+    response ??
+    NextResponse.json({ error: "Image not found." }, { status: 404 })
+  );
 }

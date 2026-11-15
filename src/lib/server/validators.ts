@@ -1,5 +1,8 @@
 import type { JobRequest } from "@/types/jobs";
 
+const QUALITIES = ["1080p", "720p", "480p"] as const;
+const YOUTUBE_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
+
 function parseOptionalInteger(
   value: unknown,
   errorMessage: string
@@ -15,23 +18,24 @@ function parseOptionalInteger(
   return parsed;
 }
 
-function isYouTubeUrl(rawUrl: string): boolean {
+export function isYouTubeUrl(rawUrl: string): boolean {
+  let url: URL;
   try {
-    const url = new URL(rawUrl);
-    const host = url.hostname.replace(/^www\./, "");
-    if (host === "youtu.be") {
-      return true;
-    }
-    if (host.endsWith("youtube.com")) {
-      return true;
-    }
-    if (host.endsWith("youtube-nocookie.com")) {
-      return true;
-    }
-    return false;
+    url = new URL(rawUrl);
   } catch {
     return false;
   }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return false;
+  }
+
+  // Match the domain itself or a real subdomain of it. A plain `endsWith`
+  // check would also accept hosts like `notyoutube.com`.
+  const host = url.hostname.toLowerCase();
+  return YOUTUBE_HOSTS.some(
+    (domain) => host === domain || host.endsWith(`.${domain}`)
+  );
 }
 
 export function parseJobRequest(payload: unknown): JobRequest {
@@ -63,23 +67,31 @@ export function parseJobRequest(payload: unknown): JobRequest {
   );
 
   if (start !== undefined && start < 0) {
-    throw new Error("Start time must be greater than or equal to 0.");
+    throw new Error("Start time must be 0 or later.");
   }
-  if (end !== undefined && end < 0) {
-    throw new Error("End time must be greater than or equal to 0.");
+  if (end !== undefined && end <= 0) {
+    throw new Error("End time must be after 0 seconds.");
   }
   if (start !== undefined && end !== undefined && end <= start) {
-    throw new Error("End time must be greater than start time.");
+    throw new Error("End time must be after the start time.");
   }
 
-  let format: "jpg" | "png" = "jpg";
+  let format: JobRequest["format"] = "jpg";
   if (data.format === "png") {
     format = "png";
   } else if (data.format !== undefined && data.format !== "jpg") {
     throw new Error("Format must be jpg or png.");
   }
 
-  const contactSheet = Boolean(data.contactSheet);
+  let quality: NonNullable<JobRequest["quality"]> = "1080p";
+  if (QUALITIES.includes(data.quality as (typeof QUALITIES)[number])) {
+    quality = data.quality as (typeof QUALITIES)[number];
+  } else if (data.quality !== undefined) {
+    throw new Error("Quality must be 1080p, 720p, or 480p.");
+  }
+
+  // Strict check: `Boolean("false")` would be true.
+  const contactSheet = data.contactSheet === true;
 
   return {
     url,
@@ -87,6 +99,7 @@ export function parseJobRequest(payload: unknown): JobRequest {
     start,
     end,
     format,
+    quality,
     contactSheet,
   };
 }

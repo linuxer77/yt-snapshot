@@ -1,33 +1,78 @@
 @import "tailwindcss";
 
+/*
+ * Graphite neutrals for every surface, one amber "timecode" accent for
+ * anything that marks a capture point. Text comes in three roles.
+ */
 :root {
-  --background: #f8fafc;
-  --foreground: #0f172a;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-body);
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --raised: #f4f4f5;
+  --selected: #ffffff;
+  --frame: #ececee;
+  --fg: #171717;
+  --fg-secondary: #525252;
+  --fg-muted: #737373;
+  --line: rgb(23 23 23 / 0.08);
+  --line-strong: rgb(23 23 23 / 0.14);
+  --accent: #b45309;
+  --accent-soft: rgb(180 83 9 / 0.1);
+  --danger: #dc2626;
+  --danger-soft: rgb(220 38 38 / 0.06);
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04);
+  --shadow-control: 0 1px 2px rgb(0 0 0 / 0.06);
+  color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0b0f1a;
-    --foreground: #e2e8f0;
+    --bg: #141415;
+    --surface: #19191b;
+    --raised: #232325;
+    --selected: #2e2e31;
+    --frame: #202022;
+    --fg: #ededed;
+    --fg-secondary: #a1a1a6;
+    --fg-muted: #85858b;
+    --line: rgb(237 237 237 / 0.08);
+    --line-strong: rgb(237 237 237 / 0.14);
+    --accent: #f5a524;
+    --accent-soft: rgb(245 165 36 / 0.14);
+    --danger: #e5484d;
+    --danger-soft: rgb(229 72 77 / 0.1);
+    --shadow-card: none;
+    --shadow-control: inset 0 1px 0 rgb(255 255 255 / 0.06);
+    color-scheme: dark;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: var(--font-body);
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-selected: var(--selected);
+  --color-frame: var(--frame);
+  --color-fg: var(--fg);
+  --color-fg-secondary: var(--fg-secondary);
+  --color-fg-muted: var(--fg-muted);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --shadow-card: var(--shadow-card);
+  --shadow-control: var(--shadow-control);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-rise: rise 400ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-@keyframes fade-up {
+@keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(14px);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
@@ -35,25 +80,36 @@ body {
   }
 }
 
-@keyframes soft-glow {
-  0% {
-    opacity: 0.5;
-  }
-  100% {
-    opacity: 0.8;
-  }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-@layer utilities {
-  .font-display {
-    font-family: var(--font-display);
-  }
+::selection {
+  background: var(--accent-soft);
+}
 
-  .animate-fade-up {
-    animation: fade-up 0.7s ease both;
-  }
+/* The interval field shows its own unit, so the browser spinner is noise. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
 
-  .animate-soft-glow {
-    animation: soft-glow 6s ease-in-out infinite alternate;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

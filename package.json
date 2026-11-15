@@ -2,23 +2,30 @@
   "name": "yt-snapshot",
   "version": "0.1.0",
   "private": true,
+  "description": "Self-hosted tool that pulls a frame from a YouTube video every N seconds, built on yt-dlp and ffmpeg.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "packageManager": "pnpm@10.30.3",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
-    "next": "16.2.6",
+    "lucide-react": "^1.73.0",
     "nanoid": "^5.0.7",
+    "next": "16.2.6",
+    "pdf-lib": "^1.17.1",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "sanitize-filename": "^1.6.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/archiver": "^6.0.3",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

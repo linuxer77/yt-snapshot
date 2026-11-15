@@ -6,7 +6,7 @@ export type JobStage =
   | "fetching_metadata"
   | "downloading"
   | "extracting"
-  | "zipping"
+  | "creating_pdf"
   | "done"
   | "failed";
 
@@ -24,6 +24,7 @@ export type JobRequest = {
   start?: number;
   end?: number;
   format: "jpg" | "png";
+  quality?: "1080p" | "720p" | "480p";
   contactSheet?: boolean;
 };
 
@@ -40,7 +41,7 @@ export type SnapshotFile = {
 
 export type JobOutput = {
   imageCount: number;
-  zipFilename?: string;
+  pdfFilename?: string;
   snapshots?: SnapshotFile[];
   contactSheet?: SnapshotFile;
 };
@@ -66,8 +67,8 @@ export type SnapshotPublic = SnapshotFile & {
 export type JobPublic = Omit<JobRecord, "output"> & {
   output?: {
     imageCount: number;
-    zipFilename?: string;
-    zipUrl?: string;
+    pdfFilename?: string;
+    pdfUrl?: string;
     snapshots?: SnapshotPublic[];
     contactSheet?: SnapshotPublic;
   };

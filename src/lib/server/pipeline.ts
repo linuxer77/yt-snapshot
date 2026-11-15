@@ -1,7 +1,7 @@
-import { createWriteStream, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import archiver from "archiver";
+import { PDFDocument } from "pdf-lib";
 import sanitizeFilename from "sanitize-filename";
 import type {
   JobLogLevel,
@@ -17,14 +17,36 @@ import {
   readJob,
   updateJob,
 } from "@/lib/server/job-store";
+import { readPositiveInt } from "@/lib/server/env";
+import { formatTimecode } from "@/lib/timecode";
 
-const YTDLP_BIN = process.env.YTDLP_PATH ?? "yt-dlp";
-const FFMPEG_BIN = process.env.FFMPEG_PATH ?? "ffmpeg";
+const YTDLP_BIN = process.env.YTDLP_PATH || "yt-dlp";
+const FFMPEG_BIN = process.env.FFMPEG_PATH || "ffmpeg";
 const MAX_LOG_LENGTH = 4000;
-const METADATA_MAX_CHARS = Number.parseInt(
-  process.env.YTDLP_METADATA_MAX_CHARS ?? "5000000",
-  10
+const METADATA_MAX_CHARS = readPositiveInt(
+  process.env.YTDLP_METADATA_MAX_CHARS,
+  5_000_000
 );
+const MAX_FRAMES = readPositiveInt(process.env.MAX_FRAMES, 300);
+
+// Frames are picked when the clock crosses a multiple of the interval. The
+// small tolerance keeps a frame that sits exactly on the end time.
+const END_TOLERANCE_SECONDS = 0.05;
+const CONTACT_SHEET_TILE_WIDTH = 320;
+const CONTACT_SHEET_MAX_COLUMNS = 10;
+const PDF_READ_BATCH_SIZE = 30;
+
+const QUALITY_HEIGHT = { "1080p": 1080, "720p": 720, "480p": 480 } as const;
+
+const YTDLP_BASE_ARGS = [
+  "--no-update",
+  "--js-runtimes",
+  "node",
+  "--extractor-args",
+  "youtube:player_client=tv,web_embedded",
+  "--no-playlist",
+  "--no-progress",
+];
 
 async function logJob(jobId: string, level: JobLogLevel, message: string) {
   const entry = { time: new Date().toISOString(), level, message };
@@ -44,6 +66,8 @@ async function logJob(jobId: string, level: JobLogLevel, message: string) {
   }
 }
 
+class MissingBinaryError extends Error {}
+
 type ProcessResult = {
   stdout: string;
   stderr: string;
@@ -58,31 +82,28 @@ function appendLimited(
   chunk: string,
   limit: number | null
 ): { value: string; truncated: boolean } {
-  if (limit === null) {
-    return { value: current + chunk, truncated: false };
-  }
-
   const combined = current + chunk;
-  if (combined.length <= limit) {
+  if (limit === null || combined.length <= limit) {
     return { value: combined, truncated: false };
   }
-
   return { value: combined.slice(-limit), truncated: true };
 }
 
-function formatProcessError(
-  command: string,
-  stderr: string,
-  stdout: string
-) {
-  const message = (stderr || stdout).replace(/\s+/g, " ").trim();
-  if (!message) {
-    return `${command} failed.`;
-  }
-  return `${command} failed: ${message}`;
+/**
+ * Picks the line worth showing from a failed process: the last `ERROR:` line
+ * when there is one (yt-dlp), otherwise the last line of output.
+ */
+function summarizeProcessOutput(output: string) {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errorLine = [...lines].reverse().find((line) => /^ERROR:/i.test(line));
+  const line = errorLine ?? lines[lines.length - 1] ?? "";
+  return line.replace(/^ERROR:\s*/i, "").slice(0, 500);
 }
 
-async function runProcess(
+function runProcess(
   command: string,
   args: string[],
   options?: { cwd?: string; maxOutputLength?: number | null }
@@ -118,11 +139,11 @@ async function runProcess(
 
     child.on("error", (error) => {
       const err = error as NodeJS.ErrnoException;
-      if (err.code === "ENOENT") {
-        reject(new Error(`${command} is not available in PATH.`));
-        return;
-      }
-      reject(error);
+      reject(
+        err.code === "ENOENT"
+          ? new MissingBinaryError(`${command} is not available in PATH.`)
+          : err
+      );
     });
 
     child.on("close", (code) => {
@@ -137,49 +158,80 @@ async function runProcess(
         });
         return;
       }
-      reject(new Error(formatProcessError(command, stderr, stdout)));
+      const summary = summarizeProcessOutput(stderr || stdout);
+      const name = path.basename(command);
+      reject(new Error(summary ? `${name} failed: ${summary}` : `${name} failed.`));
     });
   });
 }
 
+const verifiedBinaries = new Set<string>();
+
 async function ensureBinary(
   command: string,
   label: string,
-  versionArgs: string[][] = [["--version"]]
+  envVar: string,
+  versionArgs: string[]
 ) {
-  let lastError: Error | undefined;
-
-  for (const args of versionArgs) {
-    try {
-      await runProcess(command, args);
-      return;
-    } catch (error) {
-      const err = error as Error;
-      lastError = err;
-      if (err.message.includes("not available")) {
-        throw new Error(`${label} is not installed or not in PATH.`);
-      }
-    }
+  if (verifiedBinaries.has(command)) {
+    return;
   }
-
-  throw lastError ?? new Error(`${label} is not available.`);
+  try {
+    await runProcess(command, versionArgs);
+    verifiedBinaries.add(command);
+  } catch (error) {
+    if (error instanceof MissingBinaryError) {
+      throw new Error(
+        `${label} is not installed or not in PATH. Install it or set ${envVar}.`
+      );
+    }
+    throw error;
+  }
 }
 
+/** Turns raw yt-dlp errors into something a person can act on. */
 function mapYtDlpError(message: string) {
   const text = message.toLowerCase();
-  if (text.includes("not in path") || text.includes("not installed")) {
-    return message;
+  if (text.includes("private video")) {
+    return "This video is private.";
   }
-  if (text.includes("private")) {
-    return "This video is private or requires access.";
+  if (/not a bot|confirm you.?re not a bot/.test(text)) {
+    return "YouTube blocked this server with a bot check. Try again later, or update yt-dlp.";
   }
-  if (text.includes("unavailable") || text.includes("not available")) {
-    return "This video is unavailable or region blocked.";
+  if (
+    /confirm your age|age[- ]restricted|age verification|inappropriate for some users/.test(
+      text
+    )
+  ) {
+    return "This video is age-restricted and needs a signed-in account.";
   }
-  if (text.includes("sign in") || text.includes("age")) {
-    return "This video requires sign-in or age verification.";
+  if (text.includes("members-only") || text.includes("join this channel")) {
+    return "This video is only available to channel members.";
+  }
+  if (
+    text.includes("video unavailable") ||
+    text.includes("not available in your country") ||
+    text.includes("blocked it in your country")
+  ) {
+    return "This video is unavailable or blocked in this server's region.";
+  }
+  if (text.includes("unsupported url") || text.includes("not a valid url")) {
+    return "That link doesn't point to a YouTube video.";
   }
   return message;
+}
+
+async function runYtDlp(args: string[], maxOutputLength?: number | null) {
+  try {
+    return await runProcess(YTDLP_BIN, [...YTDLP_BASE_ARGS, ...args], {
+      maxOutputLength,
+    });
+  } catch (error) {
+    if (error instanceof MissingBinaryError) {
+      throw error;
+    }
+    throw new Error(mapYtDlpError((error as Error).message));
+  }
 }
 
 function safeBaseName(title: string) {
@@ -188,7 +240,8 @@ function safeBaseName(title: string) {
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^[-.]+|[-.]+$/g, "")
-    .trim();
+    .slice(0, 80)
+    .replace(/[-.]+$/g, "");
   return collapsed || "video";
 }
 
@@ -211,13 +264,13 @@ function extractJsonObjects(raw: string) {
         escaped = false;
       } else if (char === "\\") {
         escaped = true;
-      } else if (char === "\"") {
+      } else if (char === '"') {
         inString = false;
       }
       continue;
     }
 
-    if (char === "\"") {
+    if (char === '"') {
       inString = true;
       continue;
     }
@@ -239,10 +292,12 @@ function extractJsonObjects(raw: string) {
   return objects;
 }
 
+type FetchedMetadata = JobMetadata & { isLive: boolean };
+
 async function fetchMetadata(
   url: string,
   onDebug?: (message: string) => void
-): Promise<JobMetadata> {
+): Promise<FetchedMetadata> {
   const {
     stdout,
     stderr,
@@ -250,33 +305,34 @@ async function fetchMetadata(
     stderrTruncated,
     stdoutLength,
     stderrLength,
-  } = await runProcess(
-    YTDLP_BIN,
-    [
-      "--dump-single-json",
-      "--no-warnings",
-      "--no-playlist",
-      "--no-progress",
-      url,
-    ],
-    { maxOutputLength: METADATA_MAX_CHARS }
+  } = await runYtDlp(
+    ["--dump-single-json", "--no-warnings", "--", url],
+    METADATA_MAX_CHARS
   );
 
   const raw = stdout.trim();
   if (!raw) {
-    throw new Error(mapYtDlpError(stderr || "Failed to fetch metadata."));
+    throw new Error(
+      mapYtDlpError(summarizeProcessOutput(stderr) || "Failed to fetch metadata.")
+    );
   }
 
-  const tryParse = (value: string) => {
+  const tryParse = (value: string): FetchedMetadata => {
     const parsed = JSON.parse(value) as {
       title?: string;
       duration?: number;
       thumbnail?: string;
+      is_live?: boolean;
+      live_status?: string;
     };
     return {
       title: parsed.title ?? "Untitled",
       duration: parsed.duration,
       thumbnail: parsed.thumbnail,
+      isLive:
+        parsed.is_live === true ||
+        parsed.live_status === "is_live" ||
+        parsed.live_status === "is_upcoming",
     };
   };
 
@@ -295,7 +351,7 @@ async function fetchMetadata(
 
   try {
     return tryParse(raw);
-  } catch (error) {
+  } catch {
     const objects = extractJsonObjects(raw);
     if (objects.length) {
       onDebug?.(`yt-dlp stdout contained ${objects.length} JSON object(s).`);
@@ -331,21 +387,32 @@ async function fetchMetadata(
   }
 }
 
-async function downloadVideo(url: string, jobDir: string) {
-  await runProcess(YTDLP_BIN, [
-    "--no-playlist",
+async function downloadVideo(
+  url: string,
+  jobDir: string,
+  quality: keyof typeof QUALITY_HEIGHT = "1080p"
+) {
+  const height = QUALITY_HEIGHT[quality];
+  // Frames only need the picture, so skip the audio track entirely.
+  const formatSelector = `bestvideo[height<=${height}]/best[height<=${height}]/best`;
+
+  await runYtDlp([
+    "-N",
+    "4",
     "-f",
-    "best[height<=480]",
-    "--merge-output-format",
-    "mp4",
+    formatSelector,
     "-o",
     path.join(jobDir, "video.%(ext)s"),
+    "--",
     url,
   ]);
 
   const files = await fs.readdir(jobDir);
   const videoFile = files.find(
-    (file) => file.startsWith("video.") && !file.endsWith(".part")
+    (file) =>
+      file.startsWith("video.") &&
+      !file.endsWith(".part") &&
+      !file.endsWith(".ytdl")
   );
 
   if (!videoFile) {
@@ -360,29 +427,34 @@ function resolveRange(
   request: JobRequest,
   warnings: string[]
 ) {
-  const rawStart = request.start ?? 0;
-  const rawEnd = request.end ?? duration;
-  const start = Math.max(0, rawStart);
-  const end = Math.min(rawEnd, duration);
+  const start = Math.max(0, request.start ?? 0);
+  const requestedEnd = request.end ?? duration;
+  const end = Math.min(requestedEnd, duration);
 
-  if (start !== rawStart) {
-    warnings.push("Start time was adjusted to 0 seconds.");
+  if (start >= duration) {
+    throw new Error(
+      `Start time ${formatTimecode(start)} is past the end of the video (${formatTimecode(duration)}).`
+    );
   }
-  if (end !== rawEnd) {
-    warnings.push("End time was adjusted to the video duration.");
+  if (request.end !== undefined && end !== requestedEnd) {
+    warnings.push(
+      `End time was past the end of the video, so it was set to ${formatTimecode(duration)}.`
+    );
   }
   if (end <= start) {
-    throw new Error("End time must be greater than start time.");
+    throw new Error("End time must be after the start time.");
   }
-
-  const rangeDuration = end - start;
-  if (request.interval > rangeDuration) {
+  if (request.interval > end - start) {
     warnings.push(
-      "Interval is longer than the selected range. Only the first frame will be extracted."
+      "The interval is longer than the selected range, so only the first frame was taken."
     );
   }
 
-  return { start, end, rangeDuration };
+  return { start, end };
+}
+
+function expectedFrameCount(start: number, end: number, interval: number) {
+  return Math.floor((end - start) / interval) + 1;
 }
 
 async function createContactSheet(options: {
@@ -392,7 +464,10 @@ async function createContactSheet(options: {
   outputPath: string;
 }) {
   const { framesDir, format, frameCount, outputPath } = options;
-  const columns = Math.max(1, Math.ceil(Math.sqrt(frameCount)));
+  const columns = Math.min(
+    CONTACT_SHEET_MAX_COLUMNS,
+    Math.max(1, Math.ceil(Math.sqrt(frameCount)))
+  );
   const rows = Math.max(1, Math.ceil(frameCount / columns));
   const pattern = path.join(framesDir, `frame_%06d.${format}`);
 
@@ -405,9 +480,12 @@ async function createContactSheet(options: {
     "-i",
     pattern,
     "-vf",
-    `tile=${columns}x${rows}:margin=2:padding=2`,
+    // Downscale first so a long run doesn't produce a 40,000px wide image.
+    `scale=${CONTACT_SHEET_TILE_WIDTH}:-2,tile=${columns}x${rows}:margin=8:padding=8:color=0x141415`,
     "-frames:v",
     "1",
+    ...(format === "jpg" ? ["-q:v", "3"] : []),
+    "-y",
     outputPath,
   ]);
 }
@@ -436,14 +514,28 @@ async function extractFrames(options: {
   await fs.mkdir(framesDir, { recursive: true });
   const outputPattern = path.join(framesDir, `frame_%06d.${format}`);
 
-  const args = ["-hide_banner", "-loglevel", "error", "-i", videoPath];
+  // `fps=1/N` would pick the last frame of each N-second window, which lands
+  // about N/2 seconds late. Selecting the first frame at or after each
+  // multiple of the interval gives frames at exactly start, start+N, ...
+  const selectExpr = `isnan(prev_t)+gt(floor(max(t,0)/${interval}),floor(max(prev_t,0)/${interval}))`;
+
+  const args = ["-hide_banner", "-loglevel", "error", "-hwaccel", "auto"];
   if (start > 0) {
     args.push("-ss", String(start));
   }
-  if (end > start) {
-    args.push("-t", String(end - start));
-  }
-  args.push("-vf", `fps=1/${interval}`);
+  args.push(
+    "-i",
+    videoPath,
+    "-t",
+    String(end - start + END_TOLERANCE_SECONDS),
+    "-an",
+    "-sn",
+    "-dn",
+    "-vf",
+    `select='${selectExpr}'`,
+    "-fps_mode",
+    "vfr"
+  );
 
   if (format === "jpg") {
     args.push("-q:v", "2");
@@ -464,36 +556,38 @@ async function extractFrames(options: {
 
   let contactSheetFile: SnapshotFile | undefined;
   if (contactSheet) {
-    const contactPath = path.join(framesDir, `contact-sheet.${format}`);
+    const finalName = `${baseName}_contact-sheet.${format}`;
     await createContactSheet({
       framesDir,
       format,
       frameCount: extracted.length,
-      outputPath: contactPath,
+      outputPath: path.join(framesDir, finalName),
     });
-    const finalName = `${baseName}_contact-sheet.${format}`;
-    await fs.rename(contactPath, path.join(framesDir, finalName));
     contactSheetFile = { filename: finalName, timestamp: start };
   }
 
   const maxTimestamp = start + (extracted.length - 1) * interval;
   const padWidth = Math.max(4, String(Math.floor(maxTimestamp)).length);
-  const snapshots: SnapshotFile[] = [];
 
-  for (let index = 0; index < extracted.length; index += 1) {
-    const timestamp = start + index * interval;
-    const oldPath = path.join(framesDir, extracted[index]);
+  const renameResults = await Promise.all(
+    extracted.map(async (file, index) => {
+      const timestamp = start + index * interval;
+      const oldPath = path.join(framesDir, file);
 
-    if (timestamp > end) {
-      await fs.rm(oldPath, { force: true });
-      continue;
-    }
+      if (timestamp > end) {
+        await fs.rm(oldPath, { force: true });
+        return null;
+      }
 
-    const filename = `${baseName}_${zeroPad(timestamp, padWidth)}s.${format}`;
-    const newPath = path.join(framesDir, filename);
-    await fs.rename(oldPath, newPath);
-    snapshots.push({ filename, timestamp });
-  }
+      const filename = `${baseName}_${zeroPad(timestamp, padWidth)}s.${format}`;
+      await fs.rename(oldPath, path.join(framesDir, filename));
+      return { filename, timestamp };
+    })
+  );
+
+  const snapshots = renameResults.filter(
+    (item): item is SnapshotFile => item !== null
+  );
 
   if (snapshots.length === 0) {
     throw new Error("No frames matched the requested interval.");
@@ -502,32 +596,45 @@ async function extractFrames(options: {
   return { snapshots, contactSheet: contactSheetFile };
 }
 
-async function createZip(options: {
-  jobDir: string;
+async function createPdf(options: {
   framesDir: string;
-  zipFilename: string;
+  snapshots: SnapshotFile[];
+  pdfPath: string;
+  title: string;
 }) {
-  const { jobDir, framesDir, zipFilename } = options;
-  const zipPath = path.join(jobDir, zipFilename);
+  const { framesDir, snapshots, pdfPath, title } = options;
+  const pdfDoc = await PDFDocument.create();
+  pdfDoc.setTitle(title);
+  pdfDoc.setCreator("yt-snapshot");
 
-  await new Promise<void>((resolve, reject) => {
-    const output = createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
+  // Read files in small concurrent batches, then embed them in order.
+  for (let i = 0; i < snapshots.length; i += PDF_READ_BATCH_SIZE) {
+    const batch = snapshots.slice(i, i + PDF_READ_BATCH_SIZE);
+    const buffers = await Promise.all(
+      batch.map((snapshot) =>
+        fs.readFile(path.join(framesDir, snapshot.filename))
+      )
+    );
 
-    output.on("close", () => resolve());
-    output.on("error", (error) => reject(error));
-    archive.on("warning", (error) => {
-      if (error.code === "ENOENT") {
-        return;
-      }
-      reject(error);
-    });
-    archive.on("error", (error) => reject(error));
+    for (const [index, buffer] of buffers.entries()) {
+      const isPng = batch[index].filename.toLowerCase().endsWith(".png");
+      const image = isPng
+        ? await pdfDoc.embedPng(buffer)
+        : await pdfDoc.embedJpg(buffer);
 
-    archive.pipe(output);
-    archive.directory(framesDir, false);
-    archive.finalize();
-  });
+      // One page per frame, sized to the frame, so it presents edge to edge.
+      const page = pdfDoc.addPage([image.width, image.height]);
+      page.drawImage(image, {
+        x: 0,
+        y: 0,
+        width: image.width,
+        height: image.height,
+      });
+    }
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  await fs.writeFile(pdfPath, pdfBytes);
 }
 
 export async function processJob(jobId: string) {
@@ -536,13 +643,10 @@ export async function processJob(jobId: string) {
     return;
   }
 
+  let videoPath: string | undefined;
+
   try {
     await logJob(jobId, "info", "Job started.");
-    await logJob(
-      jobId,
-      "debug",
-      `Request: url=${job.request.url}, interval=${job.request.interval}s, start=${job.request.start ?? 0}s, end=${job.request.end ?? "end"}, format=${job.request.format}`
-    );
 
     await updateJob(jobId, {
       status: "running",
@@ -552,14 +656,15 @@ export async function processJob(jobId: string) {
     });
 
     await logJob(jobId, "debug", "Checking yt-dlp and ffmpeg availability.");
-    await ensureBinary(YTDLP_BIN, "yt-dlp", [["--version"], ["-version"]]);
-    await ensureBinary(FFMPEG_BIN, "ffmpeg", [["-version"], ["--version"]]);
+    await ensureBinary(YTDLP_BIN, "yt-dlp", "YTDLP_PATH", ["--version"]);
+    await ensureBinary(FFMPEG_BIN, "ffmpeg", "FFMPEG_PATH", ["-version"]);
     await logJob(jobId, "debug", "yt-dlp and ffmpeg are available.");
 
     await updateJob(jobId, { stage: "fetching_metadata", progress: 12 });
     await logJob(jobId, "info", "Fetching metadata.");
-    const metadata = await fetchMetadata(job.request.url, (message) =>
-      logJob(jobId, "debug", message)
+    const { isLive, ...metadata } = await fetchMetadata(
+      job.request.url,
+      (message) => void logJob(jobId, "debug", message)
     );
 
     await logJob(
@@ -568,6 +673,9 @@ export async function processJob(jobId: string) {
       `Metadata loaded: title="${metadata.title}", duration=${metadata.duration ?? "unknown"}s`
     );
 
+    if (isLive) {
+      throw new Error("Live streams aren't supported. Try again once the stream has ended.");
+    }
     if (!metadata.duration || metadata.duration <= 0) {
       throw new Error("Could not determine video duration.");
     }
@@ -579,28 +687,37 @@ export async function processJob(jobId: string) {
       warnings
     );
 
+    const frameCount = expectedFrameCount(start, end, job.request.interval);
+    if (frameCount > MAX_FRAMES) {
+      throw new Error(
+        `That would be ${frameCount.toLocaleString("en-US")} frames, and this server allows up to ${MAX_FRAMES.toLocaleString("en-US")}. Use a longer interval or a shorter range.`
+      );
+    }
+
     await logJob(
       jobId,
       "debug",
-      `Range resolved: start=${start}s, end=${end}s, interval=${job.request.interval}s`
+      `Range resolved: start=${start}s, end=${end}s, interval=${job.request.interval}s, about ${frameCount} frames`
     );
-    if (warnings.length) {
-      for (const warning of warnings) {
-        await logJob(jobId, "warn", warning);
-      }
+    for (const warning of warnings) {
+      await logJob(jobId, "warn", warning);
     }
 
     await updateJob(jobId, {
       metadata,
       warnings: warnings.length ? warnings : undefined,
-      progress: 20,
+      stage: "downloading",
+      progress: 25,
     });
 
-    await updateJob(jobId, { stage: "downloading", progress: 30 });
     await logJob(jobId, "info", "Downloading video.");
     const jobDir = getJobDir(jobId);
     const framesDir = getFramesDir(jobId);
-    const videoPath = await downloadVideo(job.request.url, jobDir);
+    videoPath = await downloadVideo(
+      job.request.url,
+      jobDir,
+      job.request.quality
+    );
     await logJob(jobId, "info", "Video download complete.");
 
     await updateJob(jobId, { stage: "extracting", progress: 60 });
@@ -628,6 +745,7 @@ export async function processJob(jobId: string) {
     );
 
     await fs.rm(videoPath, { force: true });
+    videoPath = undefined;
     await logJob(jobId, "debug", "Temporary video file removed.");
 
     const output: JobOutput = {
@@ -636,35 +754,42 @@ export async function processJob(jobId: string) {
       contactSheet,
     };
 
-    await updateJob(jobId, { output, progress: 75 });
-
-    await updateJob(jobId, { stage: "zipping", progress: 85 });
-    await logJob(jobId, "info", "Creating ZIP archive.");
-    const zipFilename = `${baseName}_snapshots.zip`;
-    await createZip({ jobDir, framesDir, zipFilename });
-    await logJob(jobId, "info", `ZIP ready: ${zipFilename}`);
+    await updateJob(jobId, { output, stage: "creating_pdf", progress: 85 });
+    await logJob(jobId, "info", "Creating PDF with all frames.");
+    const pdfFilename = `${baseName}_snapshots.pdf`;
+    await createPdf({
+      framesDir,
+      snapshots,
+      pdfPath: path.join(jobDir, pdfFilename),
+      title: metadata.title,
+    });
+    await logJob(jobId, "info", `PDF ready: ${pdfFilename}`);
 
     await updateJob(jobId, {
       status: "done",
       stage: "done",
       progress: 100,
-      output: {
-        ...output,
-        zipFilename,
-      },
+      output: { ...output, pdfFilename },
     });
     await logJob(jobId, "info", "Job completed successfully.");
   } catch (error) {
-    const err = error as Error;
-    const normalized = err.message.includes("yt-dlp")
-      ? mapYtDlpError(err.message)
-      : err.message;
-    await logJob(jobId, "error", normalized);
-    await updateJob(jobId, {
-      status: "failed",
-      stage: "failed",
-      progress: 100,
-      error: normalized,
-    });
+    const message =
+      error instanceof Error ? error.message : "Unexpected error.";
+    await logJob(jobId, "error", message);
+    try {
+      await updateJob(jobId, {
+        status: "failed",
+        stage: "failed",
+        progress: 100,
+        error: message,
+      });
+    } catch (updateError) {
+      // The job folder may already be gone (cleanup); nothing left to report to.
+      console.error(`[job ${jobId}] Could not record failure.`, updateError);
+    }
+  } finally {
+    if (videoPath) {
+      await fs.rm(videoPath, { force: true }).catch(() => {});
+    }
   }
 }

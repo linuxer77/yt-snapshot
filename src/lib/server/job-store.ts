@@ -1,7 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { nanoid } from "nanoid";
-import type { JobLogEntry, JobPublic, JobRecord, JobRequest } from "@/types/jobs";
+import type {
+  JobLogEntry,
+  JobPublic,
+  JobRecord,
+  JobRequest,
+} from "@/types/jobs";
 
 const JOBS_ROOT = path.join(process.cwd(), ".data", "jobs");
 const DEFAULT_TTL_MINUTES = Number.parseInt(
@@ -9,7 +14,27 @@ const DEFAULT_TTL_MINUTES = Number.parseInt(
   10
 );
 const MAX_LOG_ENTRIES = 200;
-const jobLocks = new Map<string, Promise<void>>();
+const JOB_ID_LENGTH = 10;
+const JOB_ID_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${JOB_ID_LENGTH}}$`);
+
+// Shared through globalThis because each route can be bundled separately,
+// and all writers to a job file must go through the same lock.
+const globalForJobs = globalThis as typeof globalThis & {
+  __ytSnapshotJobLocks?: Map<string, Promise<void>>;
+};
+const jobLocks = (globalForJobs.__ytSnapshotJobLocks ??= new Map());
+
+/**
+ * Job ids come from URLs, so they are checked before they touch the
+ * filesystem. Anything that is not a nanoid could be a path traversal.
+ */
+export function isValidJobId(jobId: string) {
+  return JOB_ID_PATTERN.test(jobId);
+}
+
+export function isTerminalStatus(status: JobRecord["status"]) {
+  return status === "done" || status === "failed";
+}
 
 async function withJobLock<T>(jobId: string, task: () => Promise<T>) {
   const previous = jobLocks.get(jobId) ?? Promise.resolve();
@@ -17,14 +42,15 @@ async function withJobLock<T>(jobId: string, task: () => Promise<T>) {
   const next = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const chained = previous.then(() => next);
 
-  jobLocks.set(jobId, previous.then(() => next));
+  jobLocks.set(jobId, chained);
   await previous;
   try {
     return await task();
   } finally {
     release();
-    if (jobLocks.get(jobId) === next) {
+    if (jobLocks.get(jobId) === chained) {
       jobLocks.delete(jobId);
     }
   }
@@ -58,7 +84,7 @@ export function getJobFile(jobId: string) {
 
 export async function createJob(request: JobRequest): Promise<JobRecord> {
   await ensureJobsRoot();
-  const id = nanoid(10);
+  const id = nanoid(JOB_ID_LENGTH);
   const job: JobRecord = {
     id,
     createdAt: new Date().toISOString(),
@@ -74,20 +100,26 @@ export async function createJob(request: JobRequest): Promise<JobRecord> {
 }
 
 export async function readJob(jobId: string): Promise<JobRecord | null> {
+  if (!isValidJobId(jobId)) {
+    return null;
+  }
+
+  let raw: string;
   try {
-    const raw = await fs.readFile(getJobFile(jobId), "utf8");
-    return JSON.parse(raw) as JobRecord;
+    raw = await fs.readFile(getJobFile(jobId), "utf8");
   } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === "ENOENT") {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
     }
-    if (err instanceof SyntaxError) {
-      throw new Error(
-        `Failed to parse job data for ${jobId}. The job file may be corrupted.`
-      );
-    }
     throw error;
+  }
+
+  try {
+    return JSON.parse(raw) as JobRecord;
+  } catch {
+    throw new Error(
+      `Failed to parse job data for ${jobId}. The job file may be corrupted.`
+    );
   }
 }
 
@@ -144,15 +176,28 @@ export async function appendJobLog(jobId: string, entry: JobLogEntry) {
   });
 }
 
-export async function cleanupJobs(
-  ttlMinutes: number = DEFAULT_TTL_MINUTES
-) {
-  await ensureJobsRoot();
+/**
+ * Removes job folders older than the TTL. Never throws: a single unreadable
+ * or corrupted job folder must not block new jobs from being created.
+ */
+export async function cleanupJobs(options?: {
+  ttlMinutes?: number;
+  isActive?: (jobId: string) => boolean;
+}) {
+  const ttlMinutes = options?.ttlMinutes ?? DEFAULT_TTL_MINUTES;
   if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) {
     return;
   }
 
-  const entries = await fs.readdir(JOBS_ROOT, { withFileTypes: true });
+  let entries;
+  try {
+    await ensureJobsRoot();
+    entries = await fs.readdir(JOBS_ROOT, { withFileTypes: true });
+  } catch (error) {
+    console.warn("[cleanup] Could not read the jobs folder.", error);
+    return;
+  }
+
   const now = Date.now();
   const ttlMs = ttlMinutes * 60 * 1000;
 
@@ -161,31 +206,40 @@ export async function cleanupJobs(
       .filter((entry) => entry.isDirectory())
       .map(async (entry) => {
         const jobId = entry.name;
-        const job = await readJob(jobId);
-        const jobDir = getJobDir(jobId);
-        const createdAt = job?.createdAt
-          ? Date.parse(job.createdAt)
-          : (await fs.stat(jobDir)).mtimeMs;
+        if (options?.isActive?.(jobId)) {
+          return;
+        }
 
-        if (Number.isFinite(createdAt) && now - createdAt > ttlMs) {
-          await fs.rm(jobDir, { recursive: true, force: true });
+        const jobDir = getJobDir(jobId);
+        try {
+          const job = await readJob(jobId).catch(() => null);
+          const createdAt = job?.createdAt
+            ? Date.parse(job.createdAt)
+            : (await fs.stat(jobDir)).mtimeMs;
+
+          if (Number.isFinite(createdAt) && now - createdAt > ttlMs) {
+            await fs.rm(jobDir, { recursive: true, force: true });
+          }
+        } catch (error) {
+          console.warn(`[cleanup] Could not clean up job ${jobId}.`, error);
         }
       })
   );
 }
 
-export function buildPublicJob(job: JobRecord, origin: string): JobPublic {
-  const baseUrl = `${origin.replace(/\/$/, "")}/api/jobs/${job.id}`;
+export function buildPublicJob(job: JobRecord): JobPublic {
+  const baseUrl = `/api/jobs/${job.id}`;
+  const imageUrl = (filename: string) =>
+    `${baseUrl}/images/${encodeURIComponent(filename)}`;
+
   const snapshots = job.output?.snapshots?.map((snapshot) => ({
     ...snapshot,
-    url: `${baseUrl}/images/${encodeURIComponent(snapshot.filename)}`,
+    url: imageUrl(snapshot.filename),
   }));
   const contactSheet = job.output?.contactSheet
     ? {
         ...job.output.contactSheet,
-        url: `${baseUrl}/images/${encodeURIComponent(
-          job.output.contactSheet.filename
-        )}`,
+        url: imageUrl(job.output.contactSheet.filename),
       }
     : undefined;
 
@@ -194,8 +248,8 @@ export function buildPublicJob(job: JobRecord, origin: string): JobPublic {
     output: job.output
       ? {
           imageCount: job.output.imageCount,
-          zipFilename: job.output.zipFilename,
-          zipUrl: job.output.zipFilename ? `${baseUrl}/download` : undefined,
+          pdfFilename: job.output.pdfFilename,
+          pdfUrl: job.output.pdfFilename ? `${baseUrl}/download` : undefined,
           snapshots,
           contactSheet,
         }
